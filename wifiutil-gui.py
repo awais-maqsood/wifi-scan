@@ -384,8 +384,8 @@ class App:
         self._build_crack()
 
         # Log
-        log_wrap = Frame(main, bg=C["panel"], padx=16, pady=(0, 10))
-        log_wrap.pack(fill=X)
+        log_wrap = Frame(main, bg=C["panel"], padx=16, pady=10)
+        log_wrap.pack(fill=X, pady=(0, 0))
         log_head = Frame(log_wrap, bg=C["panel"])
         log_head.pack(fill=X)
         Label(log_head, text="Log", bg=C["panel"], fg=C["text"], font=("Segoe UI", 10, "bold")).pack(

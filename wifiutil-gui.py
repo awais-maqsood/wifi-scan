@@ -389,7 +389,7 @@ class App:
         self.iface = StringVar(value="")
         self.mon_iface = StringVar(value="")  # actual monitor iface (may be wlan0mon)
         self.monitor_on = BooleanVar(value=False)
-        self.scan_duration = IntVar(value=15)
+        self.scan_duration = IntVar(value=20)
         self.client_duration = IntVar(value=20)
         self.deauth_count = IntVar(value=0)
         self.capture_name = StringVar(value="Capture-AP")
@@ -740,8 +740,12 @@ class App:
             self.monitor_on.set(True)
             extra = f"  [from {iface}]" if mon != iface else ""
             self.monitor_status.set(f"Monitor mode: ON  ({mon}){extra}")
-            self.log_msg(f"Monitor ready on {mon}. If scan is empty, click Reinit adapter.")
+            self.log_msg(f"Monitor ready on {mon}. Wait ~2s, then go to Scan (use 20s+).")
             self.refresh_ifaces()
+            # If airmon created wlan0mon, select it as the active scan iface
+            if mon != iface:
+                self.log_msg(f"NOTE: use {mon} for airodump (not {iface})")
+            time.sleep(2.0)
         except Exception as exc:
             self.log_msg(f"ERROR: {exc}")
             messagebox.showerror("Monitor mode failed", str(exc))
@@ -888,15 +892,25 @@ class App:
                 iface = mon
                 self.root.after(0, lambda m=mon: self.mon_iface.set(m))
                 self.root.after(0, lambda: self.monitor_on.set(True))
+                time.sleep(2.5)  # let firmware finish init
             else:
-                # Always reinit before scan — fixes empty airodump / not initialized
-                self.root.after(0, lambda: self.log_msg(f"Reinit {iface} before scan…"))
-                reinit_monitor(iface)
+                # Do NOT down/up reinit here — that often leaves the card
+                # uninitialized and airodump shows 0 APs. Only settle briefly.
+                unblock_radio()
+                time.sleep(1.0)
+
+            # Prefer a *mon iface if airmon-ng created one
+            for cand in list_wireless_ifaces():
+                if cand.endswith("mon") and iface_is_monitor(cand):
+                    iface = cand
+                    self.root.after(0, lambda m=cand: self.mon_iface.set(m))
+                    break
 
             info = run(["iw", "dev", iface, "info"]).stdout
             self.root.after(
                 0, lambda: self.log_msg(f"Interface: {iface}  monitor={('type monitor' in info)}")
             )
+            time.sleep(0.5)
 
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             prefix = SCAN_DIR / f"scan-{ts}"
@@ -904,6 +918,8 @@ class App:
 
             cmd = [
                 "airodump-ng",
+                "--band",
+                "abg",
                 "-w",
                 str(prefix),
                 "--write-interval",
@@ -1185,10 +1201,17 @@ class App:
                 mon = enable_monitor(base)
                 iface = mon
                 self.root.after(0, lambda m=mon: self.mon_iface.set(m))
+                time.sleep(2.5)
             else:
-                reinit_monitor(iface)
+                unblock_radio()
+                time.sleep(0.8)
+            for cand in list_wireless_ifaces():
+                if cand.endswith("mon") and iface_is_monitor(cand):
+                    iface = cand
+                    self.root.after(0, lambda m=cand: self.mon_iface.set(m))
+                    break
             run(["iw", "dev", iface, "set", "channel", str(ap["ch"]).strip()])
-            time.sleep(0.4)
+            time.sleep(0.5)
 
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             prefix = CAPTURE_DIR / f"clients-{safe_name(ap['essid'])}-{ts}"
@@ -1361,10 +1384,13 @@ class App:
                 if not iface_is_monitor(mon):
                     mon = enable_monitor(base)
                     self.root.after(0, lambda m=mon: self.mon_iface.set(m))
-                else:
-                    reinit_monitor(mon)
+                    time.sleep(2.0)
+                for cand in list_wireless_ifaces():
+                    if cand.endswith("mon") and iface_is_monitor(cand):
+                        mon = cand
+                        break
                 run(["iw", "dev", mon, "set", "channel", str(ap["ch"])])
-                time.sleep(0.3)
+                time.sleep(0.5)
                 cmd = [
                     "airodump-ng",
                     "-c",

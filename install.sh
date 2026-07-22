@@ -16,6 +16,11 @@ INSTALL_DIR="/opt/wifiutil"
 BIN_DIRS=("/usr/bin" "/usr/local/bin")
 DESKTOP_DIR="/usr/share/applications"
 
+if [[ ! -f "$SCRIPT_DIR/wifiutil-gui.py" ]]; then
+    echo "Missing wifiutil-gui.py in $SCRIPT_DIR" >&2
+    exit 1
+fi
+
 echo "[*] Installing dependencies (aircrack-ng, iw, rfkill, python3-tk)…"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
@@ -23,22 +28,36 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
 
 echo "[*] Installing to $INSTALL_DIR…"
 mkdir -p "$INSTALL_DIR"
+
+# Remove old symlinks first — writing through a symlink would overwrite the .py
+for BIN_DIR in "${BIN_DIRS[@]}"; do
+    rm -f "$BIN_DIR/wifiutil" "$BIN_DIR/wifiutil-gui" "$BIN_DIR/wifiutil-gui-pkexec"
+done
+rm -f "$INSTALL_DIR/wifiutil" "$INSTALL_DIR/wifiutil-gui"
+
 install -m 0755 "$SCRIPT_DIR/wifiutil.sh"     "$INSTALL_DIR/wifiutil.sh"
 install -m 0755 "$SCRIPT_DIR/wifiutil-gui.py" "$INSTALL_DIR/wifiutil-gui.py"
 
-# Wrapper scripts (more reliable than bare symlinks under sudo)
+# Verify we installed real Python, not a shell wrapper
+if ! head -1 "$INSTALL_DIR/wifiutil-gui.py" | grep -q python; then
+    echo "ERROR: $INSTALL_DIR/wifiutil-gui.py does not look like Python. Aborting." >&2
+    head -5 "$INSTALL_DIR/wifiutil-gui.py" >&2
+    exit 1
+fi
+
+# Wrapper scripts in PATH
 for BIN_DIR in "${BIN_DIRS[@]}"; do
     mkdir -p "$BIN_DIR"
 
-    cat > "$BIN_DIR/wifiutil" <<EOF
+    cat > "$BIN_DIR/wifiutil" <<'EOF'
 #!/usr/bin/env bash
-exec /opt/wifiutil/wifiutil.sh "\$@"
+exec /opt/wifiutil/wifiutil.sh "$@"
 EOF
     chmod 0755 "$BIN_DIR/wifiutil"
 
-    cat > "$BIN_DIR/wifiutil-gui" <<EOF
+    cat > "$BIN_DIR/wifiutil-gui" <<'EOF'
 #!/usr/bin/env bash
-exec /usr/bin/python3 /opt/wifiutil/wifiutil-gui.py "\$@"
+exec /usr/bin/python3 /opt/wifiutil/wifiutil-gui.py "$@"
 EOF
     chmod 0755 "$BIN_DIR/wifiutil-gui"
 done
@@ -92,6 +111,7 @@ echo "Installed."
 echo "  GUI:  sudo wifiutil-gui"
 echo "  CLI:  sudo wifiutil"
 echo "  Or:   sudo python3 /opt/wifiutil/wifiutil-gui.py"
-echo "  Or open \"Aircrack-ng GUI Wrapper\" from the application menu."
 echo
-command -v wifiutil-gui && ls -l "$(command -v wifiutil-gui)"
+echo "Verify:"
+head -1 /opt/wifiutil/wifiutil-gui.py
+ls -l /usr/bin/wifiutil-gui /opt/wifiutil/wifiutil-gui.py

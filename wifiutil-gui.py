@@ -330,6 +330,7 @@ class App:
         self.busy = False
         self.procs: list[subprocess.Popen] = []
         self.scan_prefix: Path | None = None
+        self.clients_prefix: Path | None = None
         self.step_buttons: dict[str, Label] = {}
         self.pages: dict[str, Frame] = {}
 
@@ -919,7 +920,9 @@ class App:
         row.pack(fill=X, pady=8)
         Label(row, text="Client scan (s):", bg=C["panel"], fg=C["text"]).pack(side=LEFT)
         Spinbox(row, from_=5, to=120, textvariable=self.client_duration, width=5).pack(side=LEFT, padx=8)
-        self._btn(row, "Find clients on AP", self.find_clients).pack(side=LEFT)
+        self._btn(row, "Find clients on AP", self.find_clients).pack(side=LEFT, padx=(0, 6))
+        self._btn(row, "Stop & load", self.stop_clients_load, danger=True).pack(side=LEFT, padx=(0, 6))
+        self._btn(row, "Load from last scan", self.load_clients_from_scan).pack(side=LEFT)
 
         Label(p, text="Connected clients (stations)", bg=C["panel"], fg=C["muted"]).pack(anchor="w")
         cwrap = Frame(p, bg=C["panel"])
@@ -988,52 +991,150 @@ class App:
         if not iface:
             return
         if self.busy:
+            self.log_msg("Already busy — use Stop & load, or Stop all.")
             return
-        duration = int(self.client_duration.get())
+        try:
+            duration = int(self.client_duration.get())
+        except (TypeError, ValueError):
+            messagebox.showerror("Invalid duration", "Client scan duration must be a number.")
+            return
         ap = self.selected_ap
         self.busy = True
-        self.log_msg(f"Finding clients on {ap['essid']} ({ap['bssid']}) for {duration}s…")
+        self.log_msg(
+            f"Finding clients on {ap['essid']} ({ap['bssid']}) ch={ap['ch']} for {duration}s…"
+        )
         threading.Thread(target=self._clients_worker, args=(iface, ap, duration), daemon=True).start()
+
+    def _apply_clients(self, clients: list[dict], source: str) -> None:
+        self.clients = clients
+        self.selected_client = None
+        self.client_tree.delete(*self.client_tree.get_children())
+        for i, c in enumerate(clients, start=1):
+            self.client_tree.insert(
+                "",
+                END,
+                iid=str(i - 1),
+                values=(i, c["station"], c["pwr"], c["packets"], c["probes"]),
+            )
+        self._refresh_target_labels()
+        self.log_msg(f"Loaded {len(clients)} client(s) from {source}")
+        if not clients:
+            messagebox.showinfo(
+                "No clients",
+                "No stations seen for this AP.\n\n"
+                "Watch the live airodump STATION table — if clients appear there, "
+                "click Stop & load.\n"
+                "Or use Load from last scan if the big scan already saw them.",
+            )
+
+    def load_clients_from_scan(self) -> None:
+        """Parse stations for the selected AP from the last full scan CSV."""
+        if not self.selected_ap:
+            messagebox.showinfo("No AP", "Select an access point first.")
+            return
+        csv_path = self.last_csv
+        if csv_path is None or not csv_path.is_file():
+            files = sorted(SCAN_DIR.glob("scan-*-01.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+            csv_path = files[0] if files else None
+        if csv_path is None or not csv_path.is_file():
+            messagebox.showinfo("No scan CSV", "Run a Scan first, then try again.")
+            return
+        clients = parse_clients_csv(csv_path, filter_bssid=self.selected_ap["bssid"])
+        self._apply_clients(clients, csv_path.name)
+
+    def stop_clients_load(self) -> None:
+        self.log_msg("Stopping client airodump and loading CSV…")
+        run(["pkill", "-INT", "-f", "airodump-ng"])
+        time.sleep(0.5)
+        run(["pkill", "-9", "-f", "airodump-ng"])
+        time.sleep(0.3)
+        csv_path = None
+        if self.clients_prefix:
+            cand = Path(f"{self.clients_prefix}-01.csv")
+            if cand.is_file():
+                csv_path = cand
+        if csv_path is None:
+            files = sorted(
+                CAPTURE_DIR.glob("clients-*-01.csv"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            csv_path = files[0] if files else None
+        self.busy = False
+        if csv_path and self.selected_ap:
+            clients = parse_clients_csv(csv_path, filter_bssid=self.selected_ap["bssid"])
+            if not clients:
+                # -d dump may list stations; show any associated row if filter missed
+                clients = parse_clients_csv(csv_path, filter_bssid=None)
+            self._apply_clients(clients, csv_path.name)
+        else:
+            self.log_msg("No client CSV found yet.")
 
     def _clients_worker(self, iface: str, ap: dict, duration: int) -> None:
         err = None
         csv_path = None
-        airodump_err = ""
         try:
             if not iface_is_monitor(iface):
                 kill_interfering()
                 enable_monitor(iface)
             unblock_radio()
             run(["iw", "dev", iface, "set", "channel", str(ap["ch"])])
+
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             prefix = CAPTURE_DIR / f"clients-{safe_name(ap['essid'])}-{ts}"
+            self.clients_prefix = prefix
+
+            # Live: airodump-ng -c CH -w PREFIX -d BSSID IFACE
             cmd = [
                 "airodump-ng",
                 "-c",
-                str(ap["ch"]),
+                str(ap["ch"]).strip(),
                 "-w",
                 str(prefix),
                 "-d",
                 ap["bssid"],
-                "--output-format",
-                "csv",
                 "--write-interval",
                 "1",
                 iface,
             ]
+            self.root.after(0, lambda: self.log_msg("CMD: " + " ".join(cmd)))
 
-            def log_from_thread(msg: str) -> None:
-                self.root.after(0, lambda m=msg: self.log_msg(m))
+            if find_terminal() is not None:
+                proc = open_in_terminal(cmd)
+                self.procs.append(proc)
+                self.root.after(
+                    0,
+                    lambda: self.log_msg(
+                        f"Live airodump opened — watch STATION table for {duration}s "
+                        "(or click Stop & load)."
+                    ),
+                )
+                time.sleep(duration)
+                self.root.after(0, lambda: self.log_msg("Stopping client airodump…"))
+                run(["pkill", "-INT", "-f", "airodump-ng"])
+                time.sleep(1)
+                run(["pkill", "-9", "-f", "airodump-ng"])
+                time.sleep(0.5)
+            else:
+                def log_from_thread(msg: str) -> None:
+                    self.root.after(0, lambda m=msg: self.log_msg(m))
 
-            _rc, airodump_err = run_airodump_timed(cmd, duration, log_cb=log_from_thread)
+                run_airodump_timed(cmd, duration, log_cb=log_from_thread)
+
             csv_path = Path(f"{prefix}-01.csv")
             if not csv_path.is_file():
-                alts = sorted(CAPTURE_DIR.glob(f"clients-{safe_name(ap['essid'])}-{ts}*.csv"))
+                alts = [
+                    p
+                    for p in sorted(CAPTURE_DIR.glob(f"clients-{safe_name(ap['essid'])}-{ts}*"))
+                    if p.suffix == ".csv" and "kismet" not in p.name
+                ]
                 if alts:
                     csv_path = alts[0]
             if not csv_path.is_file():
-                detail = airodump_err[-500:] if airodump_err else "no csv"
-                raise RuntimeError(f"No client scan output. {detail}")
+                raise RuntimeError(
+                    "No client CSV produced.\n"
+                    f"Manual: sudo airodump-ng -c {ap['ch']} -d {ap['bssid']} {iface}"
+                )
         except Exception as exc:
             err = str(exc)
 
@@ -1044,19 +1145,20 @@ class App:
                 messagebox.showerror("Client scan failed", err)
                 return
             assert csv_path is not None
-            self.last_csv = csv_path
-            self.clients = parse_clients_csv(csv_path, filter_bssid=ap["bssid"])
-            self.client_tree.delete(*self.client_tree.get_children())
-            for i, c in enumerate(self.clients, start=1):
-                self.client_tree.insert(
-                    "",
-                    END,
-                    iid=str(i - 1),
-                    values=(i, c["station"], c["pwr"], c["packets"], c["probes"]),
-                )
-            self.log_msg(f"Found {len(self.clients)} client(s)")
-            if not self.clients:
-                messagebox.showinfo("No clients", "No stations seen — scan longer or generate traffic.")
+            try:
+                preview = csv_path.read_text(errors="replace")
+                # Show station section snippet in log
+                if "Station MAC" in preview:
+                    idx = preview.index("Station MAC")
+                    self.log_msg("CSV stations: " + preview[idx : idx + 300].replace("\n", " | "))
+                else:
+                    self.log_msg("CSV has no Station MAC section yet.")
+            except OSError:
+                pass
+            clients = parse_clients_csv(csv_path, filter_bssid=ap["bssid"])
+            if not clients:
+                clients = parse_clients_csv(csv_path, filter_bssid=None)
+            self._apply_clients(clients, csv_path.name)
 
         self.root.after(0, finish)
 

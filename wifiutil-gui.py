@@ -220,6 +220,61 @@ def find_terminal() -> tuple[str, list[str]] | None:
     return None
 
 
+def run_airodump_timed(cmd: list[str], duration: int, log_cb=None) -> tuple[int, str]:
+    """
+    Run airodump-ng for `duration` seconds, then force-stop it.
+    airodump often ignores SIGTERM from GNU timeout and hangs forever —
+    so we manage the process group ourselves and escalate to SIGKILL.
+    """
+    err_file = SCAN_DIR / f"airodump-err-{os.getpid()}.log"
+    SCAN_DIR.mkdir(parents=True, exist_ok=True)
+    stderr_f = open(err_file, "w", encoding="utf-8", errors="replace")
+    # Drop ncurses UI; keep stderr for diagnostics
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_f,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if log_cb:
+        log_cb(f"PID {proc.pid}: {' '.join(cmd)}")
+
+    try:
+        proc.wait(timeout=max(1, duration) + 1)
+    except subprocess.TimeoutExpired:
+        if log_cb:
+            log_cb(f"Stopping airodump (pid {proc.pid})…")
+        try:
+            os.killpg(proc.pid, 15)  # SIGTERM process group
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, 9)  # SIGKILL
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        stderr_f.close()
+
+    err_text = ""
+    try:
+        err_text = err_file.read_text(errors="replace").strip()
+    except OSError:
+        pass
+    try:
+        err_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return proc.returncode or 0, err_text
+
+
 def open_in_terminal(cmd: list[str]) -> subprocess.Popen:
     term = find_terminal()
     if term is None:
@@ -658,8 +713,16 @@ class App:
             messagebox.showinfo("No interface", "Select an interface first.")
             return
         if self.busy:
+            self.log_msg("Scan already running — wait or press Stop all.")
             return
-        duration = int(self.scan_duration.get())
+        try:
+            duration = int(self.scan_duration.get())
+        except (TypeError, ValueError):
+            messagebox.showerror("Invalid duration", "Duration must be a number.")
+            return
+        if duration < 3:
+            messagebox.showerror("Duration too short", "Use at least 3 seconds (15+ recommended).")
+            return
         self.busy = True
         self.log_msg(f"Scanning on {iface} for {duration}s…")
         threading.Thread(target=self._scan_worker, args=(iface, duration), daemon=True).start()
@@ -667,16 +730,24 @@ class App:
     def _scan_worker(self, iface: str, duration: int) -> None:
         err = None
         csv_path = None
+        airodump_err = ""
         try:
             if not iface_is_monitor(iface):
+                self.root.after(0, lambda: self.log_msg("Enabling monitor mode for scan…"))
                 kill_interfering()
                 enable_monitor(iface)
                 self.root.after(0, lambda: self.monitor_on.set(True))
+            else:
+                # Make sure radio isn't blocked mid-session
+                unblock_radio()
+
+            info = run(["iw", "dev", iface, "info"]).stdout
+            self.root.after(0, lambda: self.log_msg(f"Interface state:\n{info.strip()[:300]}"))
+
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             prefix = SCAN_DIR / f"scan-{ts}"
+            # Do NOT wrap with GNU timeout — airodump often ignores SIGTERM and hangs.
             cmd = [
-                "timeout",
-                str(duration),
                 "airodump-ng",
                 "--output-format",
                 "csv",
@@ -686,15 +757,30 @@ class App:
                 str(prefix),
                 iface,
             ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            def log_from_thread(msg: str) -> None:
+                self.root.after(0, lambda m=msg: self.log_msg(m))
+
+            rc, airodump_err = run_airodump_timed(cmd, duration, log_cb=log_from_thread)
             csv_path = Path(f"{prefix}-01.csv")
+            # airodump may also write without -01 on some versions; check both
             if not csv_path.is_file():
-                raise RuntimeError("No scan output produced.")
+                alts = sorted(SCAN_DIR.glob(f"scan-{ts}*.csv"))
+                if alts:
+                    csv_path = alts[0]
+            if not csv_path.is_file():
+                detail = airodump_err[-800:] if airodump_err else f"exit={rc}"
+                raise RuntimeError(
+                    "No scan CSV produced. Adapter may not be in monitor mode, "
+                    f"or RF is blocked.\n{detail}"
+                )
         except Exception as exc:
             err = str(exc)
 
         def finish() -> None:
             self.busy = False
+            if airodump_err and ("failed" in airodump_err.lower() or "error" in airodump_err.lower()):
+                self.log_msg(f"airodump stderr: {airodump_err[-500:]}")
             if err:
                 self.log_msg(f"Scan failed: {err}")
                 messagebox.showerror("Scan failed", err)
@@ -711,6 +797,14 @@ class App:
                     values=(i, n["bssid"], n["ch"], n["pwr"], n["enc"], n["essid"]),
                 )
             self.log_msg(f"Scan complete — {len(self.networks)} AP(s)  ({csv_path.name})")
+            if not self.networks:
+                messagebox.showinfo(
+                    "No APs found",
+                    "Scan finished but no access points were parsed.\n\n"
+                    "Try: longer duration (20s), move closer, check antenna, "
+                    "or run in a terminal:\n"
+                    f"  sudo airodump-ng {self.iface.get()}",
+                )
 
         self.root.after(0, finish)
 
@@ -847,15 +941,16 @@ class App:
     def _clients_worker(self, iface: str, ap: dict, duration: int) -> None:
         err = None
         csv_path = None
+        airodump_err = ""
         try:
             if not iface_is_monitor(iface):
                 kill_interfering()
                 enable_monitor(iface)
+            unblock_radio()
+            run(["iw", "dev", iface, "set", "channel", str(ap["ch"])])
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             prefix = CAPTURE_DIR / f"clients-{safe_name(ap['essid'])}-{ts}"
             cmd = [
-                "timeout",
-                str(duration),
                 "airodump-ng",
                 "-c",
                 str(ap["ch"]),
@@ -869,10 +964,19 @@ class App:
                 "1",
                 iface,
             ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            def log_from_thread(msg: str) -> None:
+                self.root.after(0, lambda m=msg: self.log_msg(m))
+
+            _rc, airodump_err = run_airodump_timed(cmd, duration, log_cb=log_from_thread)
             csv_path = Path(f"{prefix}-01.csv")
             if not csv_path.is_file():
-                raise RuntimeError("No client scan output.")
+                alts = sorted(CAPTURE_DIR.glob(f"clients-{safe_name(ap['essid'])}-{ts}*.csv"))
+                if alts:
+                    csv_path = alts[0]
+            if not csv_path.is_file():
+                detail = airodump_err[-500:] if airodump_err else "no csv"
+                raise RuntimeError(f"No client scan output. {detail}")
         except Exception as exc:
             err = str(exc)
 

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.cap
+*.csv
+.DS_Store

